@@ -1,0 +1,12 @@
+# Automatic HTTPS (Let's Encrypt). DOMAIN comes from .env, e.g. screentime.example.com
+{$DOMAIN} {
+	encode zstd gzip
+	reverse_proxy app:8000 {
+		flush_interval -1      # don't buffer MCP's streaming (SSE) responses
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		-Server
+	}
+}
