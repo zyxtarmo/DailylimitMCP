@@ -57,6 +57,37 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
     json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS oauth_tokens_pair ON oauth_tokens(pair_id);
+
+-- Blocked-application rules. child '*' = every child. A process matches if ANY populated identifier matches.
+CREATE TABLE IF NOT EXISTS app_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    child TEXT NOT NULL COLLATE NOCASE,
+    label TEXT NOT NULL COLLATE NOCASE,
+    image_name TEXT,
+    original_filename TEXT,
+    product_name TEXT,
+    publisher TEXT,
+    sha256 TEXT,
+    package_family TEXT,
+    created_at INTEGER NOT NULL,
+    UNIQUE (child, label)
+);
+-- Applications the agents have seen running in a child's session (identities only; strings are CHILD-CONTROLLED
+-- and sanitized before storage because they are shown to the parent's AI assistant).
+CREATE TABLE IF NOT EXISTS seen_apps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    child TEXT NOT NULL COLLATE NOCASE,
+    key TEXT NOT NULL,
+    image_name TEXT,
+    original_filename TEXT,
+    product_name TEXT,
+    publisher TEXT,
+    sha256 TEXT,
+    package_family TEXT,
+    first_seen INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL,
+    UNIQUE (child, key)
+);
 """
 
 

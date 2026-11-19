@@ -173,6 +173,8 @@ def remove_child(db: DB, actor: str, name: str, confirm: bool) -> dict:
     with db.tx():
         db.execute("DELETE FROM children WHERE name=?", (name,))
         db.execute("DELETE FROM bonuses WHERE child=?", (name,))
+        db.execute("DELETE FROM app_rules WHERE child=?", (row["name"],))
+        db.execute("DELETE FROM seen_apps WHERE child=?", (row["name"],))
         audit(db, actor, "child_removed", {"child": row["name"]})
     return {"removed": row["name"]}
 
@@ -311,12 +313,16 @@ def agent_sync(db: DB, cfg: Config, device_id: str, payload: dict, ip: str = "")
                        (device_id, n, day, float(m), ts))
         db.execute("UPDATE devices SET last_seen=?, agent_version=?, last_ip=? WHERE id=?",
                    (ts, str(payload.get("agent_version", ""))[:20], ip[:45], device_id))
+    from . import apps   # late import: apps imports core
+    apps.record_seen(db, payload.get("seen") or [], ts)
+    apps.record_events(db, device_id, payload.get("events") or [])
     users = []
     for r in db.all("SELECT * FROM children ORDER BY name"):
         b = db.one("SELECT minutes FROM bonuses WHERE child=? AND day=?", (r["name"], day))
         users.append({"Name": r["name"], "Weekday": r["weekday"], "Weekend": r["weekend"],
                       "WeekdayHours": r["weekday_hours"] or "", "WeekendHours": r["weekend_hours"] or "",
-                      "Bonus": b["minutes"] if b else 0, "LockedUntil": r["locked_until"]})
+                      "Bonus": b["minutes"] if b else 0, "LockedUntil": r["locked_until"],
+                      "Apps": apps.rules_payload(db, r["name"])})
     # server_time + utc_offset let the agent compute the server's wall-clock time, so a child changing the PC's
     # clock or time zone doesn't shift the allowed-hours window.
     offset_min = int(local_dt(cfg, ts).utcoffset().total_seconds() // 60)
