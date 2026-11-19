@@ -39,6 +39,10 @@ public static class Wts {
   public static void Msg(int id, string t, string x) { File.AppendAllText(Environment.GetEnvironmentVariable("FAKE_WTS_LOG"), "msg:" + id + ":" + x + "\n"); }
 }
 "@
+function Get-ProcessList { if ($env:FAKE_PROCS) { $env:FAKE_PROCS | ConvertFrom-Json } }
+function Stop-AppProcess([int]$id) { [IO.File]::AppendAllText($env:FAKE_WTS_LOG, "stop:" + $id + "`n") }
+function Get-FileStamp([string]$path) { '1' }
+function Get-FileIdentity([string]$path) { $m = $env:FAKE_IDS | ConvertFrom-Json; $m.$path }
 Invoke-Expression ("& '" + $env:FAKE_SCRIPT + "' " + $env:FAKE_ARGS)
 ''')
 WTSLOG = os.path.join(tmp, "wts.log")
@@ -51,7 +55,7 @@ def check(label, cond, extra=""):
     ok &= bool(cond)
 
 
-def run(sessions="", args="", rewind=True):
+def run(sessions="", args="", rewind=True, procs=None, ids=None):
     """One agent tick. rewind=True pretends the previous tick was exactly 60 s ago."""
     sf = os.path.join(DL, "state", "kid1.json")
     if rewind and os.path.exists(sf):
@@ -60,7 +64,8 @@ def run(sessions="", args="", rewind=True):
         json.dump(s, open(sf, "w"))
     if os.path.exists(WTSLOG):
         os.remove(WTSLOG)
-    e = {**env, "ProgramData": PD, "FAKE_SESSIONS": sessions, "FAKE_WTS_LOG": WTSLOG, "FAKE_SCRIPT": SCRIPT, "FAKE_ARGS": args}
+    e = {**env, "ProgramData": PD, "FAKE_SESSIONS": sessions, "FAKE_WTS_LOG": WTSLOG, "FAKE_SCRIPT": SCRIPT, "FAKE_ARGS": "-WatchSeconds 0 " + args, "windir": r"C:\Windows",
+         "FAKE_PROCS": json.dumps(procs) if procs else "", "FAKE_IDS": json.dumps(ids) if ids else "{}"}
     p = subprocess.run([PWSH, "-NoProfile", "-File", HARNESS], env=e, capture_output=True, text=True, timeout=120)
     calls = open(WTSLOG).read().splitlines() if os.path.exists(WTSLOG) else []
     if p.returncode or p.stderr.strip():
@@ -123,8 +128,38 @@ try:
     calls, _ = run(KID)
     check("S7 unlock -> allowed again", "logoff:1" not in calls, calls)
 
+    # ---- app blocking -------------------------------------------------------------
+    from app import apps  # noqa: E402
+    RB = r"C:\Users\kid1\Downloads\homework.exe"            # Roblox, renamed
+    ids = {RB: {"OriginalFilename": "Roblox.exe", "ProductName": "Roblox", "Publisher": "Roblox Corporation", "Sha256": "b" * 64, "PackageFamily": "", "ImageName": "homework.exe"},
+           r"C:\Program Files\Notepad\np.exe": {"OriginalFilename": "np.exe", "ProductName": "Notepad", "Publisher": "", "Sha256": "c" * 64, "PackageFamily": ""},
+           r"C:\Windows\System32\taskmgr.exe": {"OriginalFilename": "Taskmgr.exe", "ProductName": "Windows", "Publisher": "", "Sha256": "d" * 64, "PackageFamily": ""}}
+    procs = [{"Id": 100, "SessionId": 1, "Path": RB}, {"Id": 101, "SessionId": 2, "Path": RB},
+             {"Id": 102, "SessionId": 1, "Path": r"C:\Program Files\Notepad\np.exe"}, {"Id": 103, "SessionId": 1, "Path": r"C:\Windows\System32\taskmgr.exe"}]
+    calls, _ = run(KID, procs=procs, ids=ids)                 # nothing blocked yet: inventory only
+    check("A1 no rules -> nothing stopped", not any(c.startswith("stop:") for c in calls), calls)
+    calls, _ = run(KID, procs=procs, ids=ids)                 # pending seen delivered by this tick's sync
+    found = apps.find_apps(db, "kid1")["apps"]
+    check("A2 seen apps reported (kid1 only, windir skipped)", {a["product_name"] for a in found} == {"Roblox", "Notepad"}, found)
+    rid = next(a["id"] for a in found if a["product_name"] == "Roblox")
+    apps.block_app(db, "t", "kid1", "Roblox", from_seen_id=rid)
+    calls, _ = run(KID, procs=procs, ids=ids)
+    check("A3 renamed exe stopped via version-info/hash; other user's + notepad untouched", [c for c in calls if c.startswith("stop:")] == ["stop:100"], calls)
+    check("A3 child gets a message", any(c.startswith("msg:1:") and "Roblox is blocked" in c for c in calls), calls)
+    run(KID, procs=procs, ids=ids)
+    ev = [e for e in core.recent_audit(db, 50) if e["action"] == "app_blocked"]
+    check("A4 block event reported to server audit log", ev and ev[0]["actor"] == "agent:pc-test", ev)
+    apps.block_app(db, "t", "kid1", "Notepad", image_name="np.exe")
+    calls, _ = run(KID, procs=procs, ids=ids)
+    check("A5 image-name rule works; windir process never touched", sorted(c for c in calls if c.startswith("stop:")) == ["stop:100", "stop:102"], calls)
+    apps.unblock_app(db, "t", "kid1", "Roblox", confirm=True)
+    calls, _ = run(KID, procs=procs, ids=ids)
+    check("A6 unblock via server takes effect on next tick", [c for c in calls if c.startswith("stop:")] == ["stop:102"], calls)
+    apps.unblock_app(db, "t", "kid1", "Notepad", confirm=True)
+
     h = datetime.now(timezone.utc).hour
-    win = f"{h + 2:02d}:00-{h + 3:02d}:00" if h < 20 else "01:00-02:00"
+    wh = 10 if h != 10 else 14                                  # fixed window the PC's clock is NOT in
+    win = f"{wh:02d}:00-{wh + 1:02d}:00"
     core.set_schedule(db, cfg, "t", "kid1", weekday_hours=win, weekend_hours=win)
     calls, _ = run(KID)
     check("S8 outside allowed hours -> logoff", "logoff:1" in calls and any("outside allowed hours" in c for c in calls), (win, calls))
@@ -137,7 +172,8 @@ try:
     check("S9 repeated failure not spammed", log().count("server sync failed") == 1, log())
 
     pf = os.path.join(DL, "policy.json")
-    p = json.load(open(pf)); p["ClockOffsetSeconds"] = 2 * 3600 + 1800
+    nowd = datetime.now(timezone.utc)
+    p = json.load(open(pf)); p["ClockOffsetSeconds"] = int((wh * 3600 + 1800 - (nowd.hour * 3600 + nowd.minute * 60 + nowd.second)) % 86400)
     json.dump(p, open(pf, "w"))
     calls, _ = run(KID, "-NoSync")
     check("S10 trusted clock offset applied (shifted into window -> allowed)", "logoff:1" not in calls, calls)

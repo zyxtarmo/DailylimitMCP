@@ -16,16 +16,41 @@ Claude app ──MCP over HTTPS + OAuth──►  server (VPS, Docker, Caddy TLS
 ## What you can ask Claude
 
 "How much screen time has Emma used today?" · "Lock Emma for 30 minutes, it's dinner." · "Emma may have 15 extra
-minutes today for homework." · "Set Jonas's weekday limit to 90 minutes and weekday hours to 15:00-20:00."
+minutes today for homework." · "Set Jonas's weekday limit to 90 minutes and weekday hours to 15:00-20:00." · "What has Emma been running lately?" ·
+"Block Roblox for Emma." · "Unblock it" (asks you to confirm).
 
 Tools: `list_children`, `get_usage`, `set_schedule`, `add_bonus`, `lock_child`, `unlock_child`, `remove_child`,
-`device_status`, `recent_activity`.
+`device_status`, `recent_activity`, and for app blocking `find_apps`, `block_app`, `unblock_app`, `list_blocked_apps`.
 
 **Guardrails.** Anything that *loosens* limits (more minutes, wider hours, unlock, remove) is refused unless the call
 carries `confirm=true`; Claude is instructed to pass that only after you explicitly agree. Bonus time has a per-day
 cap (`MAX_BONUS_PER_DAY`) and needs a reason. Tightening (lock, fewer minutes, shorter hours) is always immediate.
 Every change is written to an audit log (`recent_activity`). Note the confirm step is enforced by the tool contract and
 Claude's behaviour, not by a second factor – the daily cap is the hard backstop.
+
+## Blocking apps
+
+The agent reports (names only) which programs each child runs; ask Claude to `find_apps`, then `block_app`. Rules are
+per child (or `*` = everyone) and a program matches if **any** recorded identifier matches, so renaming the `.exe`
+doesn't help: SHA-256, Microsoft Store package family, *verified* Authenticode publisher, version-info
+OriginalFilename / ProductName, or an image-name glob. By default a rule made from a seen app matches on
+OriginalFilename + ProductName + package family + hash (not the whole publisher; ask for that explicitly).
+
+* **How it's enforced:** for ~40 s of every per-minute run the agent watches the child's session and stops matching
+  processes (`Stop-Process`), with a "this app is blocked" message. A blocked program can flash for up to ~3 s, and
+  there is a gap of up to ~20 s between runs. This is detect-and-kill, not launch prevention; AppLocker/SRP (Windows
+  Pro/Enterprise only) is not used in v1.
+* **Safety:** rules that would hit Windows itself are refused (core process names, `Microsoft Corporation` as
+  publisher, patterns with < 4 literal characters); the agent also never kills anything under `%windir%`.
+  Blocking is tightening (immediate); `unblock_app` needs `confirm=true`. Rule changes and each blocked-app event
+  are in `recent_activity`.
+* **Prompt-injection:** program names come from the child's PC, so they are normalised to letters/digits/basic
+  punctuation (40 chars) before storage, returned with an "untrusted data" note, and Claude is instructed never to act
+  on them.
+* Limits: a child with admin rights, a portable app that changes its hash *and* version info *and* is unsigned, or a
+  tool that restarts faster than the poll can still slip through; hash rules break on app updates (prefer the
+  default multi-identifier rule). Processes under `%windir%` are never inspected, and a program that makes itself look
+  like a `Microsoft Corporation` binary can't be blocked by publisher by design.
 
 ## 1. Deploy the server (a small VPS, ~1 GB RAM is plenty)
 
@@ -86,7 +111,7 @@ Within a minute the PC picks it up (`& "$env:ProgramData\DailyLimit\DailyLimit.p
 
 ```bash
 cd server && python -m venv .venv && . .venv/bin/activate && pip install -r requirements-dev.txt
-python -m pytest tests/test_core.py -q        # policy rules + guards
+python -m pytest tests -q --ignore=tests/e2e.py --ignore=tests/agent_e2e.py   # policy rules, guards, app rules
 python tests/e2e.py                            # OAuth (DCR, login, PKCE, refresh) + MCP tools + agent API
 # agent logic on Linux (needs PowerShell 7: pwsh), fake session API against the real server:
 python tests/agent_e2e.py /path/to/pwsh ../agent/DailyLimit.ps1

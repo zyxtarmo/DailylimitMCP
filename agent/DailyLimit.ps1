@@ -1,5 +1,5 @@
 <#
-  DailyLimit.ps1 (v2) - per-user daily screen-time cap AND allowed-hours window for local Windows accounts.
+  DailyLimit.ps1 (v3) - per-user daily screen-time cap AND allowed-hours window for local Windows accounts.
   Runs as SYSTEM from a scheduled task every minute (see Install-DailyLimit.ps1).
 
   Two modes:
@@ -14,6 +14,11 @@
     * outside the allowed hours, or while locked by a parent -> logged off (also when logging in)
     * daily minutes used up                                  -> logged off
     * warnings at 10 / 5 / 1 minutes left (whichever limit ends first)
+    * blocked apps (managed mode): the server sends per-child rules; for ~40 s of every run the agent watches the
+      child's processes and stops any that match. A rule matches on ANY identifier: SHA-256, Store package family,
+      verified Authenticode publisher, version-info OriginalFilename / ProductName, or image-name glob - so renaming
+      the .exe doesn't help. The agent also reports which programs the child runs (names only) so the parent can pick
+      what to block, and how many times a blocked app was stopped.
 
   Admin helpers (run elevated):
     .\DailyLimit.ps1 -Status [-User kid]
@@ -27,13 +32,14 @@ param(
     [switch]$Status,
     [int]$AddMinutes = 0,
     [switch]$Reset,
-    [switch]$NoSync
+    [switch]$NoSync,
+    [int]$WatchSeconds = 40
 )
 
 $ErrorActionPreference = 'Stop'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 
-$AgentVersion = '2'
+$AgentVersion = '3'
 $Dir        = Join-Path $env:ProgramData 'DailyLimit'
 $CfgFile    = Join-Path $Dir 'config.json'
 $SrvFile    = Join-Path $Dir 'server.json'
@@ -41,6 +47,8 @@ $PolFile    = Join-Path $Dir 'policy.json'
 $SyncStatus = Join-Path $Dir 'sync.status'
 $StDir      = Join-Path $Dir 'state'
 $LogFile    = Join-Path $Dir 'log.txt'
+$IdFile     = Join-Path $Dir 'idcache.json'
+$PendFile   = Join-Path $Dir 'pending.json'
 $WarnAt     = 10, 5, 1
 
 function Write-Log([string]$m) {
@@ -151,6 +159,113 @@ function Get-Users($pol) {
     return @(Get-LocalUsers)
 }
 
+
+# ---- app-blocking helpers -----------------------------------------------------------
+# Never touch these, whatever the server says (mirrors the server-side list).
+$CriticalNames = 'explorer','dwm','winlogon','csrss','smss','wininit','services','lsass','svchost','sihost','ctfmon','taskhostw',
+    'fontdrvhost','logonui','userinit','runtimebroker','conhost','dllhost','wmiprvse','audiodg','applicationframehost',
+    'shellexperiencehost','startmenuexperiencehost','searchhost','textinputhost','securityhealthsystray','system','registry',
+    'taskmgr','powershell','cmd','pwsh'
+
+# Same normalisation as the server's clean_text(), so identifiers read from the PC compare equal to stored rules.
+function Clean-Text([string]$s, [int]$n = 40) {
+    if ([string]::IsNullOrEmpty($s)) { return '' }
+    $sb = New-Object Text.StringBuilder
+    foreach ($ch in $s.Normalize([Text.NormalizationForm]::FormKC).ToCharArray()) {
+        $c = [string][Globalization.CharUnicodeInfo]::GetUnicodeCategory($ch)
+        if ($c -like '*Letter' -or $c -in 'DecimalDigitNumber', 'LetterNumber', 'OtherNumber' -or " .-_()+&',".Contains([string]$ch)) { [void]$sb.Append($ch) }
+    }
+    $t = ($sb.ToString() -replace '\s+', ' ').Trim()
+    if ($t.Length -gt $n) { $t = $t.Substring(0, $n) }
+    return $t
+}
+
+# Which identifier of the process matches the rule? (first hit wins; $null = no match). Mirrors server rule_matches().
+function Test-AppRule($r, $id) {
+    if ($r.Sha256 -and $id.Sha256 -and ([string]$r.Sha256 -ieq [string]$id.Sha256)) { return 'sha256' }
+    if ($r.PackageFamily -and $id.PackageFamily -and ([string]$r.PackageFamily -ieq [string]$id.PackageFamily)) { return 'package_family' }
+    if ($r.Publisher -and $id.Publisher -and ([string]$r.Publisher -ieq [string]$id.Publisher)) { return 'publisher' }
+    if ($r.OriginalFilename -and $id.OriginalFilename -and ([string]$r.OriginalFilename -ieq [string]$id.OriginalFilename)) { return 'original_filename' }
+    if ($r.ProductName -and $id.ProductName -and ([string]$r.ProductName -ieq [string]$id.ProductName)) { return 'product_name' }
+    if ($r.ImageName -and $id.ImageName -and ([string]$id.ImageName -like [string]$r.ImageName)) { return 'image_name' }
+    return $null
+}
+
+# Thin OS wrappers. Defined only if not already present so tests can substitute fakes.
+if (-not (Test-Path function:Get-ProcessList)) {
+    function Get-ProcessList {
+        Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = $null; try { $p = $_.Path } catch {}
+            if ($p) { [pscustomobject]@{ Id = $_.Id; SessionId = $_.SessionId; Path = $p } }
+        }
+    }
+}
+if (-not (Test-Path function:Stop-AppProcess)) {
+    function Stop-AppProcess([int]$id) { Stop-Process -Id $id -Force -ErrorAction Stop }
+}
+if (-not (Test-Path function:Get-FileStamp)) {
+    function Get-FileStamp([string]$path) { $f = Get-Item -LiteralPath $path -ErrorAction Stop; "$($f.Length)-$($f.LastWriteTimeUtc.Ticks)" }
+}
+if (-not (Test-Path function:Get-FileIdentity)) {
+    function Get-FileIdentity([string]$path) {
+        $vi = (Get-Item -LiteralPath $path -ErrorAction Stop).VersionInfo
+        $pub = ''
+        try {                                   # only a VALID signature counts as a publisher
+            $sig = Get-AuthenticodeSignature -LiteralPath $path
+            if ($sig.Status -eq 'Valid' -and $sig.SignerCertificate) { $pub = $sig.SignerCertificate.GetNameInfo('SimpleName', $false) }
+        } catch {}
+        $sha = ''
+        try { $sha = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLower() } catch {}
+        $pkg = ''                               # Store app: ...\WindowsApps\<Name>_<ver>_<arch>__<publisherId>\...
+        if ($path -match '\\WindowsApps\\([^\\]+)\\') { $p = $Matches[1].Split('_'); if ($p.Count -ge 5) { $pkg = $p[0] + '_' + $p[-1] } }
+        [pscustomobject]@{ OriginalFilename = (Clean-Text $vi.OriginalFilename); ProductName = (Clean-Text $vi.ProductName)
+                           Publisher = (Clean-Text $pub); Sha256 = $sha; PackageFamily = $pkg }
+    }
+}
+
+function Get-Pending {
+    $p = [pscustomobject]@{ Seen = @(); Events = @{} }
+    if (Test-Path $PendFile) {
+        try {
+            $j = Get-Content $PendFile -Raw | ConvertFrom-Json
+            $p.Seen = @($j.Seen)
+            foreach ($e in @($j.Events)) { if ($e.Key) { $p.Events[[string]$e.Key] = [int]$e.Count } }
+        } catch { Write-Log 'pending.json unreadable, reset' }
+    }
+    return $p
+}
+function Set-Pending($p) {
+    $ev = @($p.Events.Keys | ForEach-Object { @{ Key = $_; Count = $p.Events[$_] } })
+    ConvertTo-Json -InputObject @{ Seen = @($p.Seen | Select-Object -First 200); Events = $ev } -Depth 5 -Compress | Set-Content -Path $PendFile -Encoding UTF8
+}
+
+$script:Ids = @{}; $script:Reported = @{}; $script:IdsDirty = $false
+if (Test-Path $IdFile) {
+    try {
+        $j = Get-Content $IdFile -Raw | ConvertFrom-Json
+        foreach ($pr in $j.Ids.PSObject.Properties) { $script:Ids[$pr.Name] = $pr.Value }
+        foreach ($pr in $j.Reported.PSObject.Properties) { $script:Reported[$pr.Name] = [long]$pr.Value }
+    } catch { Write-Log 'idcache unreadable, reset' }
+}
+$script:RunIds = @{}
+
+function Resolve-App([string]$path) {
+    if ($script:RunIds.ContainsKey($path)) { return $script:RunIds[$path] }
+    $id = $null
+    try {
+        $key = "$path|$(Get-FileStamp $path)"
+        $id = $script:Ids[$key]
+        if (-not $id) {
+            $id = Get-FileIdentity $path
+            $id | Add-Member -NotePropertyName ImageName -NotePropertyValue (Clean-Text (($path -split '[\\/]')[-1])) -Force
+            if ($script:Ids.Count -ge 2000) { $script:Ids = @{} }
+            $script:Ids[$key] = $id; $script:IdsDirty = $true
+        }
+    } catch { Write-Log "identity failed for ${path}: $($_.Exception.Message)" }
+    $script:RunIds[$path] = $id
+    return $id
+}
+
 # ---- sync with the control server (managed mode) -----------------------------------
 function Invoke-Sync($users) {
     $srv = Get-Content $SrvFile -Raw | ConvertFrom-Json
@@ -159,7 +274,11 @@ function Invoke-Sync($users) {
         $s = Get-UserState ([string]$u.Name)
         $report += @{ name = [string]$u.Name; minutes = [Math]::Round([double]$s.Minutes, 2) }
     }
-    $body = ConvertTo-Json -InputObject @{ day = $today; agent_version = $AgentVersion; users = @($report) } -Depth 5 -Compress
+    $pend = Get-Pending
+    $seenOut = @($pend.Seen | Select-Object -First 100)
+    $evKeys  = @($pend.Events.Keys | Select-Object -First 20)
+    $evOut   = @($evKeys | ForEach-Object { $c, $l = $_ -split '\|', 2; @{ child = $c; label = $l; count = [int]$pend.Events[$_] } })
+    $body = ConvertTo-Json -InputObject @{ day = $today; agent_version = $AgentVersion; users = @($report); seen = $seenOut; events = $evOut } -Depth 6 -Compress
     $t0 = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $resp = Invoke-RestMethod -Uri (([string]$srv.Url).TrimEnd('/') + '/agent/v1/sync') -Method Post -TimeoutSec 8 `
         -ContentType 'application/json; charset=utf-8' `
@@ -173,7 +292,11 @@ function Invoke-Sync($users) {
         SyncedEpoch        = $t1
         Users              = @($resp.Users)
     }
-    ConvertTo-Json -InputObject $new -Depth 6 | Set-Content -Path $PolFile -Encoding UTF8
+    ConvertTo-Json -InputObject $new -Depth 8 | Set-Content -Path $PolFile -Encoding UTF8
+    # delivered -> drop from the outbox
+    $pend.Seen = @($pend.Seen | Select-Object -Skip $seenOut.Count)
+    foreach ($k in $evKeys) { $pend.Events.Remove($k) }
+    Set-Pending $pend
 }
 
 function Set-SyncStatus([string]$state, [string]$detail) {
@@ -316,5 +439,67 @@ foreach ($u in $users) {
         Set-UserState $name $st
     } catch {
         Write-Log "[$name] error: $_"
+    }
+}
+
+# ---- app watcher: stop blocked programs in managed children's sessions -------------------------
+if ($managed -and $pol) {
+    $winDir = [string]$env:windir
+    $blockedNow = @{}                     # "child|label" -> count this run
+    $newSeen = @()
+    $told = @{}
+    $deadline = [DateTime]::UtcNow.AddSeconds($WatchSeconds)
+    do {
+        try {
+            $sess = @([Wts]::Sessions() | ForEach-Object { $p = $_.Split('|'); [pscustomobject]@{ Id = [int]$p[0]; User = $p[1] } })
+            $procs = @(Get-ProcessList)
+            foreach ($u in $users) {
+                $kid  = [string]$u.Name
+                $ids  = @($sess | Where-Object { $_.User -ieq $kid } | ForEach-Object { $_.Id })
+                if ($ids.Count -eq 0) { continue }
+                $rules = @($u.Apps)
+                foreach ($pr in $procs) {
+                    if ($ids -notcontains [int]$pr.SessionId) { continue }
+                    $path = [string]$pr.Path
+                    if ($winDir -and $path.StartsWith($winDir, [StringComparison]::OrdinalIgnoreCase)) { continue }
+                    $id = Resolve-App $path
+                    if (-not $id) { continue }
+                    if ($CriticalNames -contains (($path -split '[\\/]')[-1] -replace '\.exe$', '').ToLower()) { continue }
+                    $hit = $null
+                    foreach ($r in $rules) { if ($r.Label -and (Test-AppRule $r $id)) { $hit = $r; break } }
+                    if ($hit) {
+                        try {
+                            Stop-AppProcess ([int]$pr.Id)
+                            $k = "$kid|$($hit.Label)"; $blockedNow[$k] = 1 + [int]$blockedNow[$k]
+                            if (-not $told.ContainsKey($k)) {
+                                $told[$k] = $true
+                                [Wts]::Msg($ids[0], 'Blocked app', "$($hit.Label) is blocked on this computer.")
+                                Write-Log "[$kid] stopped blocked app '$($hit.Label)' (pid $($pr.Id), matched $(Test-AppRule $hit $id))"
+                            }
+                        } catch { Write-Log "[$kid] could not stop pid $($pr.Id): $($_.Exception.Message)" }
+                    } else {
+                        $rk = "$kid|$path|$($id.Sha256)"
+                        if ((Get-TrustedEpoch $pol) - [long]$script:Reported[$rk] -gt 86400) {
+                            $script:Reported[$rk] = Get-TrustedEpoch $pol; $script:IdsDirty = $true
+                            $newSeen += @{ child = $kid; image_name = $id.ImageName; original_filename = $id.OriginalFilename; product_name = $id.ProductName
+                                           publisher = $id.Publisher; sha256 = $id.Sha256; package_family = $id.PackageFamily }
+                        }
+                    }
+                }
+            }
+        } catch { Write-Log "app watcher error: $($_.Exception.Message)" }
+        if ([DateTime]::UtcNow.AddSeconds(3) -lt $deadline) { Start-Sleep -Seconds 3 } else { break }
+    } while ($true)
+
+    if ($newSeen.Count -gt 0 -or $blockedNow.Count -gt 0) {
+        $pend = Get-Pending
+        $pend.Seen = @(@($pend.Seen) + $newSeen | Select-Object -Last 200)
+        foreach ($k in $blockedNow.Keys) { $pend.Events[$k] = [int]$pend.Events[$k] + $blockedNow[$k] }
+        Set-Pending $pend
+    }
+    if ($script:IdsDirty) {
+        $now0 = Get-TrustedEpoch $pol
+        $rep = @{}; foreach ($k in $script:Reported.Keys) { if ($now0 - [long]$script:Reported[$k] -lt 172800) { $rep[$k] = $script:Reported[$k] } }
+        ConvertTo-Json -InputObject @{ Ids = $script:Ids; Reported = $rep } -Depth 5 -Compress | Set-Content -Path $IdFile -Encoding UTF8
     }
 }
